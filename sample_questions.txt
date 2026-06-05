@@ -1,0 +1,19 @@
+Here are some sample questions you can use to test the Text-to-SQL web application with the generated "student.db" database:
+
+--- Simple Queries ---
+1. List all students who have a GPA higher than 3.5.
+2. Show all courses offered along with their credits.
+3. List the students in class 12th who are in Section A.
+4. Who is teaching the course CS101?
+
+--- Aggregations and Grouping ---
+5. What is the average GPA of all students?
+6. Count how many students are enrolled in the course MATH201.
+7. Show the count of students in each class.
+8. Find the maximum GPA among all students.
+
+--- Join Queries (Multi-table) ---
+9. Show the names of students enrolled in "Introduction to Computer Science".
+10. List all courses that Priya Patel has enrolled in.
+11. List the student names, their course IDs, and their grades for all enrollments.
+12. Show student names and instructors for students who got an 'A' grade.
