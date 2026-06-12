@@ -2,3 +2,6 @@ streamlit
 google-generativeai
 python-dotenv
 pandas
+pymongo
+mongomock
+plotly

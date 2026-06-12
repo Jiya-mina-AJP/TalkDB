@@ -1,0 +1,44 @@
+[
+  {
+    "product_name": "Premium Wireless Headphones",
+    "category": "Electronics",
+    "price": 199.99,
+    "stock": 45,
+    "ratings": 4.7
+  },
+  {
+    "product_name": "Ergonomic Office Chair",
+    "category": "Furniture",
+    "price": 249.50,
+    "stock": 12,
+    "ratings": 4.5
+  },
+  {
+    "product_name": "Smart Fitness Watch",
+    "category": "Electronics",
+    "price": 129.00,
+    "stock": 80,
+    "ratings": 4.2
+  },
+  {
+    "product_name": "Organic Green Tea Blend",
+    "category": "Groceries",
+    "price": 14.99,
+    "stock": 150,
+    "ratings": 4.8
+  },
+  {
+    "product_name": "Durable Running Shoes",
+    "category": "Apparel",
+    "price": 89.95,
+    "stock": 60,
+    "ratings": 4.4
+  },
+  {
+    "product_name": "Stainless Steel Water Bottle",
+    "category": "Home & Kitchen",
+    "price": 24.99,
+    "stock": 200,
+    "ratings": 4.6
+  }
+]

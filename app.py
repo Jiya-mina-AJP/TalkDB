@@ -7,6 +7,9 @@ import tempfile
 import json
 import uuid
 from dotenv import load_dotenv
+import pymongo
+import mongomock
+import plotly.express as px
 
 def split_sql_statements(sql_text):
     """Split a SQL script into individual statements, handling quotes and comments."""
@@ -107,7 +110,15 @@ st.markdown("""
         color: #c9c9d9;
     }
     [data-testid="stHeader"] {
-        background: transparent;
+        display: none !important;
+    }
+    #MainMenu {
+        visibility: hidden !important;
+        display: none !important;
+    }
+    footer {
+        visibility: hidden !important;
+        display: none !important;
     }
     [data-testid="stSidebar"] {
         background: #0d0d14 !important;
@@ -438,6 +449,8 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "query_input" not in st.session_state:
     st.session_state.query_input = ""
+if "query_to_run" not in st.session_state:
+    st.session_state.query_to_run = None
 if "last_results" not in st.session_state:
     st.session_state.last_results = None
 if "last_query" not in st.session_state:
@@ -448,9 +461,14 @@ if "last_explanation" not in st.session_state:
     st.session_state.last_explanation = ""
 if "error_msg" not in st.session_state:
     st.session_state.error_msg = ""
+if "mongo_client" not in st.session_state:
+    st.session_state.mongo_client = None
+if "mongo_db_name" not in st.session_state:
+    st.session_state.mongo_db_name = "test"
 
 def set_question(q):
     st.session_state.query_input = q
+    st.session_state.query_to_run = q
 
 # ----------------- SIDEBAR -----------------
 st.sidebar.markdown("""
@@ -465,109 +483,217 @@ if api_key:
 # Model hardcoded — not shown in UI
 selected_model = "gemini-2.5-flash"
 
-st.sidebar.markdown('<div class="sidebar-section-label">Database</div>', unsafe_allow_html=True)
-uploaded_files = st.sidebar.file_uploader(
-    "Upload database (.db, .sqlite, .sql, .csv)", 
-    type=["db", "sqlite", "sql", "csv"], 
-    accept_multiple_files=True
+st.sidebar.markdown('<div class="sidebar-section-label">Database Engine</div>', unsafe_allow_html=True)
+db_engine = st.sidebar.selectbox(
+    "Select Engine",
+    options=["SQL (SQLite/CSV)", "NoSQL (MongoDB)"],
+    index=0,
+    key="db_engine_selectbox"
 )
 
 db_path = None
-if uploaded_files:
-    temp_dir = tempfile.gettempdir()
-    db_path = os.path.join(temp_dir, f"temp_db_{st.session_state.session_uuid}.db")
-    
-    # Safely clean up existing tables in temp db to start fresh
-    try:
-        if os.path.exists(db_path):
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-            tables = [row[0] for row in cursor.fetchall()]
-            for table in tables:
-                cursor.execute(f"DROP TABLE IF EXISTS [{table}];")
-            conn.commit()
-            conn.close()
-    except Exception:
-        # Fallback to file deletion if open connections are not locking it
+
+if db_engine == "SQL (SQLite/CSV)":
+    st.sidebar.markdown('<div class="sidebar-section-label">Database File</div>', unsafe_allow_html=True)
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload database (.db, .sqlite, .sql, .csv)", 
+        type=["db", "sqlite", "sql", "csv"], 
+        accept_multiple_files=True,
+        key="sql_file_uploader"
+    )
+
+    if uploaded_files:
+        temp_dir = tempfile.gettempdir()
+        db_path = os.path.join(temp_dir, f"temp_db_{st.session_state.session_uuid}.db")
+        
+        # Safely clean up existing tables in temp db to start fresh
         try:
-            os.remove(db_path)
+            if os.path.exists(db_path):
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+                tables = [row[0] for row in cursor.fetchall()]
+                for table in tables:
+                    cursor.execute(f"DROP TABLE IF EXISTS [{table}];")
+                conn.commit()
+                conn.close()
         except Exception:
-            pass
-
-    # Process uploaded files
-    has_sqlite = any(f.name.endswith(('.db', '.sqlite')) for f in uploaded_files)
-    
-    if has_sqlite:
-        if len(uploaded_files) > 1:
-            st.sidebar.error("Please upload only ONE SQLite database (.db/.sqlite) file at a time.")
-            db_path = None
-        else:
-            # Direct SQLite database copy
+            # Fallback to file deletion if open connections are not locking it
             try:
-                with open(db_path, "wb") as f:
-                    f.write(uploaded_files[0].getbuffer())
-                st.sidebar.markdown(f'<div class="status-pill active">● {uploaded_files[0].name}</div>', unsafe_allow_html=True)
-            except Exception as e:
-                st.sidebar.error(f"Error loading SQLite database: {e}")
+                os.remove(db_path)
+            except Exception:
+                pass
+
+        # Process uploaded files
+        has_sqlite = any(f.name.endswith(('.db', '.sqlite')) for f in uploaded_files)
+        
+        if has_sqlite:
+            if len(uploaded_files) > 1:
+                st.sidebar.error("Please upload only ONE SQLite database (.db/.sqlite) file at a time.")
                 db_path = None
+            else:
+                # Direct SQLite database copy
+                try:
+                    with open(db_path, "wb") as f:
+                        f.write(uploaded_files[0].getbuffer())
+                    st.sidebar.markdown(f'<div class="status-pill active">● {uploaded_files[0].name}</div>', unsafe_allow_html=True)
+                except Exception as e:
+                    st.sidebar.error(f"Error loading SQLite database: {e}")
+                    db_path = None
+        else:
+            conn = None
+            try:
+                conn = sqlite3.connect(db_path)
+                csv_count = 0
+                sql_count = 0
+
+                # First, execute SQL scripts (skip unsupported non-SQLite commands silently)
+                for f in uploaded_files:
+                    if f.name.endswith('.sql'):
+                        sql_text = f.read().decode('utf-8')
+                        statements = split_sql_statements(sql_text)
+                        skip_prefixes = [
+                            'create database', 'use ', 'set ', 'alter database',
+                            'lock tables', 'unlock tables', '/*!'
+                        ]
+                        for stmt in statements:
+                            stmt_clean = stmt.strip()
+                            if not stmt_clean:
+                                continue
+                            if any(stmt_clean.lower().startswith(p) for p in skip_prefixes):
+                                continue
+                            try:
+                                conn.execute(stmt_clean)
+                            except sqlite3.Error:
+                                pass  # Silently skip incompatible statements
+                        sql_count += 1
+
+                # Load CSV files as tables
+                for f in uploaded_files:
+                    if f.name.endswith('.csv'):
+                        df = pd.read_csv(f)
+                        table_name = os.path.splitext(f.name)[0].strip().replace(" ", "_").replace("-", "_").lower()
+                        df.to_sql(table_name, conn, if_exists="replace", index=False)
+                        csv_count += 1
+
+                conn.commit()
+
+                # Count how many tables were actually created
+                cursor = conn.cursor()
+                cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+                table_count = cursor.fetchone()[0]
+
+                st.sidebar.markdown(
+                    f'<div class="status-pill active">● {table_count} table{"s" if table_count != 1 else ""} loaded</div>',
+                    unsafe_allow_html=True
+                )
+
+            except Exception as e:
+                st.sidebar.error(f"Error: {e}")
+                db_path = None
+            finally:
+                if conn:
+                    conn.close()
     else:
-        conn = None
-        try:
-            conn = sqlite3.connect(db_path)
-            csv_count = 0
-            sql_count = 0
+        st.sidebar.markdown('<div class="status-pill inactive">○ No file uploaded</div>', unsafe_allow_html=True)
+        st.sidebar.caption("Supported formats: .db · .sqlite · .sql · .csv")
 
-            # First, execute SQL scripts (skip unsupported non-SQLite commands silently)
-            for f in uploaded_files:
-                if f.name.endswith('.sql'):
-                    sql_text = f.read().decode('utf-8')
-                    statements = split_sql_statements(sql_text)
-                    skip_prefixes = [
-                        'create database', 'use ', 'set ', 'alter database',
-                        'lock tables', 'unlock tables', '/*!'
-                    ]
-                    for stmt in statements:
-                        stmt_clean = stmt.strip()
-                        if not stmt_clean:
-                            continue
-                        if any(stmt_clean.lower().startswith(p) for p in skip_prefixes):
-                            continue
-                        try:
-                            conn.execute(stmt_clean)
-                        except sqlite3.Error:
-                            pass  # Silently skip incompatible statements
-                    sql_count += 1
+else:  # NoSQL (MongoDB)
+    st.sidebar.markdown('<div class="sidebar-section-label">Connection Mode</div>', unsafe_allow_html=True)
+    mongo_mode = st.sidebar.radio(
+        "Mode", 
+        ["Upload JSON Collections", "Live MongoDB Connection"],
+        label_visibility="collapsed"
+    )
 
-            # Load CSV files as tables
-            for f in uploaded_files:
-                if f.name.endswith('.csv'):
-                    df = pd.read_csv(f)
-                    table_name = os.path.splitext(f.name)[0].strip().replace(" ", "_").replace("-", "_").lower()
-                    df.to_sql(table_name, conn, if_exists="replace", index=False)
-                    csv_count += 1
+    if mongo_mode == "Upload JSON Collections":
+        uploaded_json_files = st.sidebar.file_uploader(
+            "Upload JSON collection files", 
+            type=["json"], 
+            accept_multiple_files=True,
+            key="mongo_json_uploader"
+        )
+        if uploaded_json_files:
+            try:
+                # Initialize mongomock client
+                mock_client = mongomock.MongoClient()
+                mongo_db = mock_client["test"]
+                st.session_state.mongo_client = mock_client
+                st.session_state.mongo_db_name = "test"
+                
+                loaded_collections = 0
+                for f in uploaded_json_files:
+                    content_str = f.read().decode('utf-8')
+                    collection_name = os.path.splitext(f.name)[0].strip().replace(" ", "_").replace("-", "_").lower()
+                    
+                    try:
+                        data = json.loads(content_str)
+                        if isinstance(data, dict):
+                            data = [data]
+                    except json.JSONDecodeError:
+                        data = []
+                        for line in content_str.strip().split("\n"):
+                            if line.strip():
+                                try:
+                                    data.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    pass
+                    
+                    if data:
+                        mongo_db[collection_name].drop()
+                        mongo_db[collection_name].insert_many(data)
+                        loaded_collections += 1
+                
+                st.sidebar.markdown(
+                    f'<div class="status-pill active">● {loaded_collections} collection{"s" if loaded_collections != 1 else ""} loaded</div>',
+                    unsafe_allow_html=True
+                )
+            except Exception as e:
+                st.sidebar.error(f"Error loading JSON data: {e}")
+                st.session_state.mongo_client = None
+        else:
+            st.session_state.mongo_client = None
+            st.sidebar.markdown('<div class="status-pill inactive">○ No JSON files uploaded</div>', unsafe_allow_html=True)
+            st.sidebar.caption("Upload JSON files (e.g. products.json) to simulate collections in-memory.")
 
-            conn.commit()
-
-            # Count how many tables were actually created
-            cursor = conn.cursor()
-            cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-            table_count = cursor.fetchone()[0]
-
+    else:  # Live MongoDB Connection
+        mongo_uri = st.sidebar.text_input(
+            "Connection URI", 
+            value="mongodb://localhost:27017",
+            placeholder="mongodb://username:password@host:port"
+        )
+        
+        default_db_name = "test"
+        if mongo_uri:
+            try:
+                from pymongo.uri_parser import parse_uri
+                parsed = parse_uri(mongo_uri)
+                if parsed.get("database"):
+                    default_db_name = parsed["database"]
+            except Exception:
+                pass
+        
+        mongo_db_name_input = st.sidebar.text_input("Database Name", value=default_db_name)
+        
+        if st.sidebar.button("Connect to MongoDB"):
+            try:
+                with st.spinner("Connecting..."):
+                    client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+                    client.server_info()
+                    st.session_state.mongo_client = client
+                    st.session_state.mongo_db_name = mongo_db_name_input
+                    st.sidebar.success("Connected successfully!")
+            except Exception as e:
+                st.sidebar.error(f"Connection failed: {e}")
+                st.session_state.mongo_client = None
+        
+        if st.session_state.mongo_client is not None and not isinstance(st.session_state.mongo_client, mongomock.MongoClient):
             st.sidebar.markdown(
-                f'<div class="status-pill active">● {table_count} table{"s" if table_count != 1 else ""} loaded</div>',
+                f'<div class="status-pill active">● Connected to {st.session_state.mongo_db_name}</div>',
                 unsafe_allow_html=True
             )
-
-        except Exception as e:
-            st.sidebar.error(f"Error: {e}")
-            db_path = None
-        finally:
-            if conn:
-                conn.close()
-else:
-    st.sidebar.markdown('<div class="status-pill inactive">○ No file uploaded</div>', unsafe_allow_html=True)
-    st.sidebar.caption("Supported formats: .db · .sqlite · .sql · .csv")
+        else:
+            st.sidebar.markdown('<div class="status-pill inactive">○ Disconnected</div>', unsafe_allow_html=True)
 
 
 # Helper functions to extract database schema
@@ -611,35 +737,76 @@ def get_db_schema_details(db_file):
         st.sidebar.error(f"Error reading database: {e}")
         return {}
 
+def get_mongo_schema_details(client, db_name):
+    try:
+        db = client[db_name]
+        collections = db.list_collection_names()
+        schema_info = {}
+        for coll_name in collections:
+            if coll_name.startswith("system."):
+                continue
+            coll = db[coll_name]
+            doc_count = coll.count_documents({})
+            samples = list(coll.find().limit(3))
+            
+            cleaned_samples = []
+            for s in samples:
+                s_copy = dict(s)
+                if "_id" in s_copy:
+                    s_copy["_id"] = str(s_copy["_id"])
+                cleaned_samples.append(s_copy)
+            
+            fields = {}
+            for s in samples:
+                for k, v in s.items():
+                    if k == "_id":
+                        fields[k] = {"name": k, "type": "ObjectId", "pk": True}
+                    else:
+                        fields[k] = {"name": k, "type": type(v).__name__, "pk": False}
+            
+            schema_info[coll_name] = {
+                "columns": list(fields.values()),
+                "document_count": doc_count,
+                "samples": cleaned_samples,
+                "create_sql": None
+            }
+        return schema_info
+    except Exception as e:
+        st.sidebar.error(f"Error reading MongoDB: {e}")
+        return {}
+
 # ----------------- SIDEBAR SCHEMA EXPLORER -----------------
 schema_data = {}
 if db_path:
     schema_data = get_db_schema_details(db_path)
-    
-    if schema_data:
-        st.sidebar.markdown("<h3 style='font-family:Space Grotesk; margin-top: 1rem;'>📊 Database Schema</h3>", unsafe_allow_html=True)
-        for tbl_name, info in schema_data.items():
-            with st.sidebar.expander(tbl_name, expanded=False):
-                st.markdown(f'<div class="table-name-tag">{tbl_name}</div>', unsafe_allow_html=True)
-                for col in info["columns"]:
-                    pk_class = " pk" if col["pk"] else ""
-                    pk_symbol = " ◆" if col["pk"] else ""
-                    st.markdown(f'<span class="col-tag{pk_class}">{col["name"]}&nbsp;<em style="color:#3a3a5a">{col["type"]}</em>{pk_symbol}</span>', unsafe_allow_html=True)
-                
-                # Show raw schema SQL
-                if info["create_sql"]:
-                    st.code(info["create_sql"], language="sql")
-                
-                # Show tiny sample data preview
-                if info["samples"]:
-                    st.markdown("**Sample Data Preview:**")
-                    st.dataframe(pd.DataFrame(info["samples"]), use_container_width=True)
+elif st.session_state.mongo_client is not None:
+    schema_data = get_mongo_schema_details(st.session_state.mongo_client, st.session_state.mongo_db_name)
+
+if schema_data:
+    st.sidebar.markdown("<h3 style='font-family:Space Grotesk; margin-top: 1rem;'>📊 Database Schema</h3>", unsafe_allow_html=True)
+    for tbl_name, info in schema_data.items():
+        with st.sidebar.expander(tbl_name, expanded=False):
+            st.markdown(f'<div class="table-name-tag">{tbl_name}</div>', unsafe_allow_html=True)
+            for col in info["columns"]:
+                pk_class = " pk" if col["pk"] else ""
+                pk_symbol = " ◆" if col["pk"] else ""
+                st.markdown(f'<span class="col-tag{pk_class}">{col["name"]}&nbsp;<em style="color:#3a3a5a">{col["type"]}</em>{pk_symbol}</span>', unsafe_allow_html=True)
+            
+            # Show raw schema SQL or Document Count
+            if db_engine == "NoSQL (MongoDB)":
+                st.markdown(f"**Documents:** `{info.get('document_count', 0)}`")
+            elif info.get("create_sql"):
+                st.code(info["create_sql"], language="sql")
+            
+            # Show tiny sample data preview
+            if info["samples"]:
+                st.markdown("**Sample Data Preview:**")
+                st.dataframe(pd.DataFrame(info["samples"]), use_container_width=True)
 
 # ----------------- MAIN AREA -----------------
 st.markdown("""
 <div class="page-header">
     <h1>Easif<span>AI</span></h1>
-    <p>Ask questions in plain English. Get accurate SQL, instant results, and clear explanations — powered by Gemini.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -664,40 +831,76 @@ tab_workspace, tab_schema_details, tab_history = st.tabs([
 # ----------------- TAB 1: WORKSPACE -----------------
 with tab_workspace:
     # Suggested questions
-    if db_path and "students" in [t.lower() for t in schema_data.keys()]:
+    suggestions = []
+    if db_engine == "SQL (SQLite/CSV)":
+        if db_path and "students" in [t.lower() for t in schema_data.keys()]:
+            suggestions = [
+                "List all students with GPA above 3.5.",
+                "Count students enrolled in MATH201.",
+                "Names of students in 'Introduction to Computer Science'.",
+                "Students and instructors who received an A grade."
+            ]
+    else:  # MongoDB
+        if st.session_state.mongo_client is not None:
+            collections = [t.lower() for t in schema_data.keys()]
+            if any("product" in c for c in collections):
+                suggestions = [
+                    "Find all products with price greater than 100.",
+                    "Show products in the 'Electronics' category.",
+                    "List products sorted by stock in descending order.",
+                    "Count how many products have stock less than 10."
+                ]
+
+    if suggestions:
         st.markdown('<div class="section-label">Suggested Questions</div>', unsafe_allow_html=True)
         cols = st.columns(2)
-        suggestions = [
-            "List all students with GPA above 3.5.",
-            "Count students enrolled in MATH201.",
-            "Names of students in 'Introduction to Computer Science'.",
-            "Students and instructors who received an A grade."
-        ]
         for i, q in enumerate(suggestions):
             if cols[i % 2].button(q, key=f"sug_{i}"):
-                st.session_state.query_input = q
+                st.session_state.query_to_run = q
                 st.rerun()
 
-    # Query input
-    st.markdown('<div class="section-label">Ask a question</div>', unsafe_allow_html=True)
-    st.markdown('<div class="query-panel">', unsafe_allow_html=True)
-    user_query = st.text_input(
-        "",
-        value=st.session_state.query_input,
-        placeholder="e.g. What is the average GPA of students in class 12th?",
-        key="query_text_input",
-        label_visibility="collapsed"
-    )
-    run_clicked = st.button("Run Query →", type="primary")
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Empty State or Welcome State
+    if not db_path and db_engine == "SQL (SQLite/CSV)":
+        st.markdown("""
+        <div style="text-align: center; padding: 3rem 1.5rem; background: #0d0d18; border: 1px dashed #1e1a2e; border-radius: 10px; margin-bottom: 1.5rem;">
+            <div style="font-size: 2.5rem; margin-bottom: 1rem;">📁</div>
+            <h3 style="margin: 0 0 0.5rem 0; color: #f0f0ff;">No Database Loaded</h3>
+            <p style="margin: 0; color: #4a4a6a; font-size: 0.9rem;">Upload a SQLite database, SQL script, or CSV files in the sidebar to get started.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    elif db_engine == "NoSQL (MongoDB)" and st.session_state.mongo_client is None:
+        st.markdown("""
+        <div style="text-align: center; padding: 3rem 1.5rem; background: #0d0d18; border: 1px dashed #1e1a2e; border-radius: 10px; margin-bottom: 1.5rem;">
+            <div style="font-size: 2.5rem; margin-bottom: 1rem;">🍃</div>
+            <h3 style="margin: 0 0 0.5rem 0; color: #f0f0ff;">No MongoDB Connection</h3>
+            <p style="margin: 0; color: #4a4a6a; font-size: 0.9rem;">Upload JSON collections or enter a connection URI in the sidebar to get started.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    elif st.session_state.last_results is None and not st.session_state.error_msg:
+        st.markdown("""
+        <div style="text-align: center; padding: 3rem 1.5rem; background: #0d0d18; border: 1px solid #1e1a2e; border-radius: 10px; margin-bottom: 1.5rem;">
+            <div style="font-size: 2.5rem; margin-bottom: 1rem;">⚡</div>
+            <h3 style="margin: 0 0 0.5rem 0; color: #f0f0ff;">Database Ready</h3>
+            <p style="margin: 0; color: #4a4a6a; font-size: 0.9rem;">Ask a question in the chat input below or select a suggested question to analyze your data.</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-    if (run_clicked or user_query != st.session_state.last_query) and run_clicked:
+    # Query input retrieval and execution logic
+    query_to_run = None
+    if st.session_state.get("query_to_run"):
+        query_to_run = st.session_state.query_to_run
+        st.session_state.query_to_run = None
+
+    if query_to_run:
+        user_query = query_to_run
         if not api_key:
-            st.error("🔑 Please enter a Gemini API Key in the sidebar first.")
-        elif not db_path:
-            st.error("📁 Please upload a SQLite database (.db or .sqlite) file in the sidebar to query.")
+            st.session_state.error_msg = "🔑 Please enter a Gemini API Key in the sidebar first."
+        elif db_engine == "SQL (SQLite/CSV)" and not db_path:
+            st.session_state.error_msg = "📁 Please upload a SQLite database (.db or .sqlite) file in the sidebar to query."
+        elif db_engine == "NoSQL (MongoDB)" and st.session_state.mongo_client is None:
+            st.session_state.error_msg = "📁 Please upload JSON collections or connect to a MongoDB connection URI in the sidebar to query."
         elif not user_query.strip():
-            st.warning("💬 Please enter a valid question.")
+            st.session_state.error_msg = "💬 Please enter a valid question."
         else:
             st.session_state.last_query = user_query
             st.session_state.error_msg = ""
@@ -705,20 +908,21 @@ with tab_workspace:
             st.session_state.last_results = None
             st.session_state.last_explanation = ""
             
-            with st.spinner("🧠 Translating question to SQL using Gemini Pro..."):
-                # 1. Format schema information for prompt context
-                schema_context = []
-                for table, info in schema_data.items():
-                    schema_context.append(f"Table: {table}")
-                    schema_context.append(f"SQL Schema: {info['create_sql']}")
-                    if info['samples']:
-                        schema_context.append(f"Sample Row: {json.dumps(info['samples'][0])}")
-                    schema_context.append("")
-                
-                schema_text = "\n".join(schema_context)
-                
-                # 2. Query Gemini to generate SQL
-                prompt = f"""You are an expert database administrator and SQLite SQL generator.
+            if db_engine == "SQL (SQLite/CSV)":
+                with st.spinner("🧠 Translating question to SQL using Gemini Pro..."):
+                    # 1. Format schema information for prompt context
+                    schema_context = []
+                    for table, info in schema_data.items():
+                        schema_context.append(f"Table: {table}")
+                        schema_context.append(f"SQL Schema: {info['create_sql']}")
+                        if info['samples']:
+                            schema_context.append(f"Sample Row: {json.dumps(info['samples'][0])}")
+                        schema_context.append("")
+                    
+                    schema_text = "\n".join(schema_context)
+                    
+                    # 2. Query Gemini to generate SQL
+                    prompt = f"""You are an expert database administrator and SQLite SQL generator.
 Your job is to translate the user's natural language question into a valid, executable SQLite query based on the database schema provided below.
 
 === DATABASE SCHEMA ===
@@ -733,52 +937,148 @@ Your job is to translate the user's natural language question into a valid, exec
 Question: {user_query}
 SQL Query:"""
 
-                try:
-                    # Initialize model
-                    model = genai.GenerativeModel(selected_model)
-                    response = model.generate_content(prompt)
-                    generated_sql = response.text.strip()
-                    
-                    # Clean up formatting if the model didn't obey instructions
-                    if generated_sql.startswith("```"):
-                        lines = generated_sql.split("\n")
-                        # Remove first line if it starts with ```
-                        if lines[0].startswith("```"):
-                            lines = lines[1:]
-                        # Remove last line if it starts with ```
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        generated_sql = "\n".join(lines).strip()
-                    
-                    # Strip extra SQL specifier if present
-                    if generated_sql.lower().startswith("sql"):
-                        generated_sql = generated_sql[3:].strip()
+                    try:
+                        # Initialize model
+                        model = genai.GenerativeModel(selected_model)
+                        response = model.generate_content(prompt)
+                        generated_sql = response.text.strip()
                         
-                    st.session_state.last_sql = generated_sql
-                    
-                except Exception as e:
-                    st.session_state.error_msg = f"Gemini API Error: {e}"
+                        # Clean up formatting if the model didn't obey instructions
+                        if generated_sql.startswith("```"):
+                            lines = generated_sql.split("\n")
+                            # Remove first line if it starts with ```
+                            if lines[0].startswith("```"):
+                                lines = lines[1:]
+                            # Remove last line if it starts with ```
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            generated_sql = "\n".join(lines).strip()
+                        
+                        # Strip extra SQL specifier if present
+                        if generated_sql.lower().startswith("sql"):
+                            generated_sql = generated_sql[3:].strip()
+                            
+                        st.session_state.last_sql = generated_sql
+                        
+                    except Exception as e:
+                        st.session_state.error_msg = f"Gemini API Error: {e}"
 
-            # 3. Execute SQL Query
-            if not st.session_state.error_msg:
-                if st.session_state.last_sql.startswith("--"):
-                    st.session_state.error_msg = f"Could not answer: {st.session_state.last_sql[2:].strip()}"
-                else:
-                    with st.spinner("⚡ Running SQL query..."):
+                # 3. Execute SQL Query
+                if not st.session_state.error_msg:
+                    if st.session_state.last_sql.startswith("--"):
+                        st.session_state.error_msg = f"Could not answer: {st.session_state.last_sql[2:].strip()}"
+                    else:
+                        with st.spinner("⚡ Running SQL query..."):
+                            try:
+                                conn = sqlite3.connect(db_path)
+                                # Run and load to dataframe
+                                df = pd.read_sql_query(st.session_state.last_sql, conn)
+                                st.session_state.last_results = df
+                                conn.close()
+                            except Exception as e:
+                                st.session_state.error_msg = f"SQL Execution Error: {e}"
+            else:
+                with st.spinner("🧠 Translating question to MongoDB query using Gemini Pro..."):
+                    # 1. Format schema info
+                    schema_context = []
+                    for table, info in schema_data.items():
+                        schema_context.append(f"Collection: {table}")
+                        schema_context.append(f"Document Count: {info.get('document_count', 0)}")
+                        if info['samples']:
+                            schema_context.append(f"Sample Document: {json.dumps(info['samples'][0])}")
+                        schema_context.append("")
+                    
+                    schema_text = "\n".join(schema_context)
+                    
+                    # 2. Query Gemini to generate MQL
+                    prompt = f"""You are an expert MongoDB database administrator and MQL (MongoDB Query Language) generator.
+Your job is to translate the user's natural language question into a valid, executable MongoDB query JSON block based on the collection schemas provided below.
+
+=== COLLECTION SCHEMAS ===
+{schema_text}
+
+=== INSTRUCTIONS ===
+1. Generate a valid JSON object matching this structure:
+{{
+  "collection": "<collection_name>",
+  "operation": "find" or "aggregate",
+  "query": <query dictionary for find, or list of pipeline stages for aggregate>
+}}
+2. Return ONLY the raw JSON object. Do not wrap the JSON in markdown blocks (e.g., do not use ```json ... ```), do not use backticks, do not include any explanatory text, and do not write anything else. Just the plain JSON code.
+3. Ensure you only query collections and fields that exist in the schemas.
+4. If the question cannot be answered, output a single JSON field matching: {{"error": "Cannot answer: Column 'X' does not exist."}}
+
+Question: {user_query}
+MongoDB JSON Query:"""
+
+                    try:
+                        model = genai.GenerativeModel(selected_model)
+                        response = model.generate_content(prompt)
+                        generated_mql = response.text.strip()
+                        
+                        if generated_mql.startswith("```"):
+                            lines = generated_mql.split("\n")
+                            if lines[0].startswith("```"):
+                                lines = lines[1:]
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            generated_mql = "\n".join(lines).strip()
+                        
+                        if generated_mql.lower().startswith("json"):
+                            generated_mql = generated_mql[4:].strip()
+                            
+                        st.session_state.last_sql = generated_mql
+                        
+                    except Exception as e:
+                        st.session_state.error_msg = f"Gemini API Error: {e}"
+
+                # 3. Execute MongoDB Query
+                if not st.session_state.error_msg:
+                    with st.spinner("⚡ Running MongoDB query..."):
                         try:
-                            conn = sqlite3.connect(db_path)
-                            # Run and load to dataframe
-                            df = pd.read_sql_query(st.session_state.last_sql, conn)
-                            st.session_state.last_results = df
-                            conn.close()
+                            mql_dict = json.loads(st.session_state.last_sql)
+                            if "error" in mql_dict:
+                                st.session_state.error_msg = mql_dict["error"]
+                            else:
+                                collection_name = mql_dict.get("collection")
+                                operation = mql_dict.get("operation", "find")
+                                query_data = mql_dict.get("query", {})
+                                
+                                if not collection_name:
+                                    raise ValueError("Missing 'collection' field in the generated query.")
+                                
+                                mongo_db = st.session_state.mongo_client[st.session_state.mongo_db_name]
+                                coll = mongo_db[collection_name]
+                                
+                                if operation == "find":
+                                    if not isinstance(query_data, dict):
+                                        query_data = {}
+                                    cursor = coll.find(query_data)
+                                    results = list(cursor)
+                                elif operation == "aggregate":
+                                    if not isinstance(query_data, list):
+                                        query_data = [query_data] if query_data else []
+                                    cursor = coll.aggregate(query_data)
+                                    results = list(cursor)
+                                else:
+                                    raise ValueError(f"Unsupported MongoDB operation: {operation}")
+                                
+                                for doc in results:
+                                    if "_id" in doc:
+                                        doc["_id"] = str(doc["_id"])
+                                
+                                df = pd.DataFrame(results)
+                                st.session_state.last_results = df
                         except Exception as e:
-                            st.session_state.error_msg = f"SQL Execution Error: {e}"
+                            st.session_state.error_msg = f"MongoDB Execution Error: {e}"
             
             # 4. Generate Natural Language Explanation
             if not st.session_state.error_msg and st.session_state.last_results is not None:
                 with st.spinner("✍️ Writing explanation..."):
                     results_json = st.session_state.last_results.head(10).to_json(orient='records')
-                    explanation_prompt = f"""You are a helpful data analyst.
+                    
+                    if db_engine == "SQL (SQLite/CSV)":
+                        explanation_prompt = f"""You are a helpful data analyst.
 Explain the results of a SQL query in simple, engaging, natural language.
 
 User's Question: {user_query}
@@ -790,6 +1090,20 @@ Query Results (JSON, limit 10 rows): {results_json}
 2. Discuss the numbers or records returned, pointing out any interesting insights or patterns.
 3. Keep it concise, professional, and friendly.
 4. Do not mention technical implementation details like SQL tables or join types unless they are directly relevant to the user's question.
+"""
+                    else:
+                        explanation_prompt = f"""You are a helpful data analyst.
+Explain the results of a MongoDB query in simple, engaging, natural language.
+
+User's Question: {user_query}
+MongoDB Query Run (JSON): {st.session_state.last_sql}
+Query Results (JSON, limit 10 rows): {results_json}
+
+=== INSTRUCTIONS ===
+1. Summarize the answer to the user's question clearly.
+2. Discuss the numbers or records returned, pointing out any interesting insights or patterns.
+3. Keep it concise, professional, and friendly.
+4. Do not mention technical implementation details like collections or aggregation pipeline stages unless they are directly relevant to the user's question.
 """
                     try:
                         model = genai.GenerativeModel(selected_model)
@@ -816,8 +1130,10 @@ Query Results (JSON, limit 10 rows): {results_json}
     if st.session_state.error_msg:
         st.error(st.session_state.error_msg)
         if st.session_state.last_sql:
-            st.markdown('<div class="section-label">Generated SQL</div>', unsafe_allow_html=True)
-            st.code(st.session_state.last_sql, language="sql")
+            query_label = "Generated MongoDB Query" if db_engine == "NoSQL (MongoDB)" else "Generated SQL"
+            query_lang = "json" if db_engine == "NoSQL (MongoDB)" else "sql"
+            st.markdown(f'<div class="section-label">{query_label}</div>', unsafe_allow_html=True)
+            st.code(st.session_state.last_sql, language=query_lang)
 
     elif st.session_state.last_results is not None:
         col_main, col_details = st.columns([3, 2])
@@ -827,21 +1143,67 @@ Query Results (JSON, limit 10 rows): {results_json}
             if st.session_state.last_results.empty:
                 st.info("Query ran successfully — no rows matched.")
             else:
-                st.dataframe(st.session_state.last_results, use_container_width=True)
-                csv_data = st.session_state.last_results.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Export CSV",
-                    data=csv_data,
-                    file_name="results.csv",
-                    mime="text/csv"
-                )
+                tab_table, tab_chart = st.tabs(["📋 Table View", "📊 Chart Visualisation"])
+                
+                with tab_table:
+                    st.dataframe(st.session_state.last_results, use_container_width=True)
+                    csv_data = st.session_state.last_results.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Export CSV",
+                        data=csv_data,
+                        file_name="results.csv",
+                        mime="text/csv"
+                    )
+                
+                with tab_chart:
+                    df = st.session_state.last_results
+                    cols = df.columns.tolist()
+                    if len(cols) < 2:
+                        st.info("At least 2 columns are required to generate a visualization.")
+                    else:
+                        col_c1, col_c2, col_c3 = st.columns(3)
+                        with col_c1:
+                            chart_type = st.selectbox("Chart Type", ["Bar", "Line", "Area", "Scatter", "Pie"], key="chart_type_select")
+                        with col_c2:
+                            x_axis = st.selectbox("X-Axis (Category/Time)", cols, key="chart_x_axis")
+                        with col_c3:
+                            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+                            y_default = numeric_cols if numeric_cols else cols
+                            y_axis = st.multiselect("Y-Axis (Values)", cols, default=y_default[:1], key="chart_y_axis")
+                        
+                        if not y_axis:
+                            st.warning("Please select at least one Y-Axis column.")
+                        else:
+                            try:
+                                if chart_type == "Bar":
+                                    st.bar_chart(df, x=x_axis, y=y_axis)
+                                elif chart_type == "Line":
+                                    st.line_chart(df, x=x_axis, y=y_axis)
+                                elif chart_type == "Area":
+                                    st.area_chart(df, x=x_axis, y=y_axis)
+                                elif chart_type == "Scatter":
+                                    st.scatter_chart(df, x=x_axis, y=y_axis)
+                                elif chart_type == "Pie":
+                                    fig = px.pie(df, names=x_axis, values=y_axis[0])
+                                    fig.update_layout(
+                                        template="plotly_dark",
+                                        paper_bgcolor="rgba(0,0,0,0)",
+                                        plot_bgcolor="rgba(0,0,0,0)",
+                                        font=dict(color="#c9c9d9"),
+                                        margin=dict(t=20, b=20, l=20, r=20)
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                            except Exception as chart_err:
+                                st.error(f"Error rendering chart: {chart_err}")
 
             st.markdown('<div class="section-label" style="margin-top:1.5rem">Explanation</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="explanation-block">{st.session_state.last_explanation}</div>', unsafe_allow_html=True)
 
         with col_details:
-            st.markdown('<div class="section-label">Generated SQL</div>', unsafe_allow_html=True)
-            st.code(st.session_state.last_sql, language="sql")
+            query_label = "Generated MongoDB Query" if db_engine == "NoSQL (MongoDB)" else "Generated SQL"
+            query_lang = "json" if db_engine == "NoSQL (MongoDB)" else "sql"
+            st.markdown(f'<div class="section-label">{query_label}</div>', unsafe_allow_html=True)
+            st.code(st.session_state.last_sql, language=query_lang)
 
             n_rows = len(st.session_state.last_results)
             n_cols = len(st.session_state.last_results.columns)
@@ -855,10 +1217,10 @@ Query Results (JSON, limit 10 rows): {results_json}
 
 # Schema tab
 with tab_schema_details:
-    if not db_path:
-        st.info("Upload a database to inspect its schema here.")
+    if not schema_data:
+        st.info("Upload a database or connect to a data source to inspect its schema here.")
     else:
-        st.markdown('<div class="section-label">Table Definitions</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Schema Definitions</div>', unsafe_allow_html=True)
         for idx, (tbl_name, info) in enumerate(schema_data.items()):
             with st.expander(tbl_name, expanded=(idx == 0)):
                 col_t1, col_t2 = st.columns([1, 2])
@@ -866,12 +1228,18 @@ with tab_schema_details:
                     st.markdown(f'<div class="table-name-tag">{tbl_name}</div>', unsafe_allow_html=True)
                     cols_df = pd.DataFrame(info["columns"])
                     if not cols_df.empty:
-                        cols_df = cols_df.rename(columns={"name": "Column", "type": "Type", "notnull": "Not Null", "pk": "PK"})
+                        cols_df = cols_df.rename(columns={"name": "Column/Field", "type": "Type", "pk": "Primary Key"})
+                        if "notnull" in cols_df.columns:
+                            cols_df = cols_df.rename(columns={"notnull": "Not Null"})
+                        cols_df = cols_df[[c for c in ["Column/Field", "Type", "Not Null", "Primary Key"] if c in cols_df.columns]]
                         st.table(cols_df)
                 with col_t2:
-                    st.code(info["create_sql"], language="sql")
+                    if db_engine == "NoSQL (MongoDB)":
+                        st.markdown(f"**Document Count:** `{info.get('document_count', 0)}`")
+                    else:
+                        st.code(info["create_sql"], language="sql")
                     if info["samples"]:
-                        st.caption("Sample rows")
+                        st.caption("Sample documents" if db_engine == "NoSQL (MongoDB)" else "Sample rows")
                         st.dataframe(pd.DataFrame(info["samples"]), use_container_width=True)
 
 # History tab
@@ -884,10 +1252,18 @@ with tab_history:
             with st.expander(item['question'], expanded=(idx == 0)):
                 col_h1, col_h2 = st.columns([1, 1])
                 with col_h1:
-                    st.caption("SQL")
-                    st.code(item['sql'], language="sql")
+                    is_json_query = item['sql'].strip().startswith("{")
+                    h_lang = "json" if is_json_query else "sql"
+                    st.caption("MongoDB Query" if is_json_query else "SQL")
+                    st.code(item['sql'], language=h_lang)
                 with col_h2:
                     st.caption("Explanation")
                     st.markdown(f'<div class="explanation-block" style="font-size:0.85rem">{item["explanation"]}</div>', unsafe_allow_html=True)
                 st.caption("Preview")
                 st.dataframe(item['results'].head(5), use_container_width=True)
+
+# ----------------- GLOBAL CHAT INPUT -----------------
+chat_query = st.chat_input("Ask a question about your database...")
+if chat_query:
+    st.session_state.query_to_run = chat_query
+    st.rerun()
